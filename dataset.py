@@ -12,7 +12,19 @@ import matplotlib.patches as patches
 class BuildDataset(torch.utils.data.Dataset):
     def __init__(self, path):
         # TODO: load dataset, make mask list
+      imgs_path, masks_path, labels_path, bboxes_path = path
+      with h5py.File(imgs_path, 'r') as file:
+        self.imgs = file['data']
 
+      with h5py.File(masks_path, 'r') as file:
+        self.masks = file['data']
+
+      self.transform = transforms.Compose([
+        transforms.Resize((800, 1066)),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Pad((11, 0)) 
+        ])
+      self.labels = np.load(labels_path, allow_pickle=True)
     # output:
         # transed_img
         # label
@@ -20,14 +32,21 @@ class BuildDataset(torch.utils.data.Dataset):
         # transed_bbox
     def __getitem__(self, index):
         # TODO: __getitem__
+        self.imgs[index]
+        raw_img = self.imgs[index]
+        raw_mask = self.masks[index]  
+        #raw_bbox = self.bboxes[index]
+        label = self.labels[index]
+        # Preprocess the raw data
+        transed_img, transed_mask, transed_bbox = self.pre_process_batch(raw_img, raw_mask, raw_bbox)
 
         # check flag
         assert transed_img.shape == (3, 800, 1088)
         assert transed_bbox.shape[0] == transed_mask.shape[0]
         return transed_img, label, transed_mask, transed_bbox
     def __len__(self):
-        return len(self.imgs_data)
-
+        #return len(self.imgs_data)
+        return len(self.labels)
     # This function take care of the pre-process of img,mask,bbox
     # in the input mini-batch
     # input:
@@ -36,13 +55,15 @@ class BuildDataset(torch.utils.data.Dataset):
         # bbox: n_box*4
     def pre_process_batch(self, img, mask, bbox):
         # TODO: image preprocess
-
+        img = img /255.0
+        img = torch.tensor(img)
+        img = self.transform(img)
         # check flag
         assert img.shape == (3, 800, 1088)
         assert bbox.shape[0] == mask.squeeze(0).shape[0]
         return img, mask, bbox
 
-
+'''
 class BuildDataLoader(torch.utils.data.DataLoader):
     def __init__(self, dataset, batch_size, shuffle, num_workers):
         self.dataset = dataset
@@ -61,7 +82,7 @@ class BuildDataLoader(torch.utils.data.DataLoader):
 
     def loader(self):
         # TODO: return a dataloader
-
+'''
 ## Visualize debugging
 if __name__ == '__main__':
     # file path and make a list
