@@ -5,7 +5,7 @@ from torch import optim
 import torch
 from torch import nn
 import torch.nn.functional as F
-from solo_branches import CategoryBranch, MaskBranch 
+from solo_branches import CategoryBranch 
 class SOLO(pl.LightningModule):
     _default_cfg = {
         'num_classes': 4,
@@ -31,7 +31,7 @@ class SOLO(pl.LightningModule):
         self.num_levels = len(self.scale_ranges)
         self.scale_ranges = torch.tensor(self.scale_ranges)
         self.category_branch = CategoryBranch()
-        self.mask_branch = MaskBranch()
+        #self.mask_branch = MaskBranch()
     # Forward function should calculate across each level of the feature pyramid network.
     # Input:
     #     images: batch_size number of images
@@ -122,6 +122,8 @@ class SOLO(pl.LightningModule):
         batch_size = len(bounding_boxes)
         img_height, img_width = masks[0].shape[-2:]
         category_targets = []
+        mask_targets = []
+        active_masks = []
         for boxes_img, labels_img, masks_img in zip(bounding_boxes, labels, masks):
             heights = boxes_img[:, 3] - boxes_img[:, 1]
             widths = boxes_img[:, 2] - boxes_img[:, 0]
@@ -131,17 +133,57 @@ class SOLO(pl.LightningModule):
             sqrt_areas = (heights*widths).sqrt()
             scale_ranges = self.scale_ranges.to(self.device)
             fpn_level_masks = (sqrt_areas.unsqueeze(dim=1) >= scale_ranges[:, 0]) & (sqrt_areas.unsqueeze(dim=1) <= scale_ranges[:, 1])
+            category_targets_per_img = []
+            active_masks_per_img = []
+            mask_targets_per_img = []
             for j in range(self.num_levels):        
-                active_mask = torch.zeros((self.num_grids[j]*self.num_grids[j])).to(self.device)
+                active_mask = torch.zeros((self.num_grids[j],self.num_grids[j])).to(self.device)
+                category_target = torch.zeros((self.num_grids[j],self.num_grids[j])).to(self.device)
+                feature_h = masks_img.shape[1] // self.strides[j]
+                feature_w = masks_img.shape[2]// self.strides[j]  
+                mask_target = torch.zeros(self.num_grids[j], self.num_grids[j], 2*feature_h, 2*feature_w).to(self.device)
+                
+                active_masks_per_img.append(active_mask)
+                category_targets_per_img.append(category_target)
+                mask_targets_per_img.append(mask_target) 
+                
                 filtered_centre_regions = centre_regions[fpn_level_masks[:, j]] 
-                
+            
                 grid_width = img_width / self.num_grids[j]
-                x_grid_start = (filtered_centre_regions[:, 0] / grid_width).ceil().int()
-                x_grid_end = (filtered_centre_regions[:, 2] / grid_width).floor().int() 
-                              
+                grid_height = img_height / self.num_grids[j]
+                if len(filtered_centre_regions) == 0:
+                    continue
                 
-#active_mask = 
-   
+                x_grid_starts = (filtered_centre_regions[:, 0] / grid_width).floor().int()
+                x_grid_ends = (filtered_centre_regions[:, 2] / grid_width).floor().int() 
+                              
+                y_grid_starts = (filtered_centre_regions[:, 1] / grid_height).floor().int()
+                y_grid_ends = (filtered_centre_regions[:, 3] / grid_height).floor().int() 
+              
+                for k in range(len(x_grid_starts)):
+                    x_grid_start = x_grid_starts[k]  
+                    x_grid_end = x_grid_ends[k]
+                    y_grid_start = y_grid_starts[k]
+                    y_grid_end = y_grid_ends[k]  
+                    active_mask[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = 1
+                    category_target[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = labels_img[k]
+                    resized_feature = F.interpolate(masks_img[k].view(1,1,img_height, -1), size=(2*feature_h, 2*feature_w), mode='nearest') 
+                    mask_target[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = resized_feature
+                active_masks_per_img[-1] = active_mask.view(-1)
+                category_targets_per_img[-1] = category_target
+                mask_targets_per_img[-1] = mask_target
+                   
+            mask_targets.append(mask_targets_per_img)
+            category_targets.append(category_targets_per_img)  
+            active_masks.append(active_masks_per_img)
+      
+        assert len(category_targets) == batch_size
+        assert len(mask_targets) == batch_size
+        assert len(active_masks) == batch_size
+        assert len(category_targets[0]) == self.num_levels
+        assert len(mask_targets[0]) == self.num_levels
+        assert len(active_masks[0]) == self.num_levels 
+        return category_targets,mask_targets,active_masks 
     
     def training_step(self, batch, batch_idx):
         imgs, labels, masks, bboxes = batch
