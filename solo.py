@@ -5,7 +5,9 @@ from torch import optim
 import torch
 from torch import nn
 import torch.nn.functional as F
-from solo_branches import CategoryBranch 
+from solo_branches import CategoryBranch, MaskBranch
+from torchvision import transforms
+import numpy as np
 class SOLO(pl.LightningModule):
     _default_cfg = {
         'num_classes': 4,
@@ -30,8 +32,8 @@ class SOLO(pl.LightningModule):
         self.backbone = pretrained_model.backbone
         self.num_levels = len(self.scale_ranges)
         self.scale_ranges = torch.tensor(self.scale_ranges)
-        self.category_branch = CategoryBranch()
-        #self.mask_branch = MaskBranch()
+        self.cat_branch = CategoryBranch()
+        self.mask_branch = MaskBranch(self.num_grids)
     # Forward function should calculate across each level of the feature pyramid network.
     # Input:
     #     images: batch_size number of images
@@ -72,8 +74,10 @@ class SOLO(pl.LightningModule):
         # check flag
         if eval == False:
             resized_feature = F.interpolate(fpn_feat, size=(self.num_grids[idx], self.num_grids[idx]), mode='bilinear') 
-            cate_pred = self.category_branch(resized_feature)
-            ins_pred = self.mask_predictions(fpn_feat)
+            cate_pred = self.cat_branch(resized_feature, idx)
+            x, y = self.generate_pixel_coordinates(fpn_feat.shape[-2:])
+            ins_pred = self.mask_branch(fpn_feat, x, y, idx)
+            ins_pred = F.interpolate(ins_pred, scale_factor=2, mode='bilinear') 
             assert cate_pred.shape[1:] == (3, num_grid, num_grid)
             assert ins_pred.shape[1:] == (num_grid**2, fpn_feat.shape[2]*2, fpn_feat.shape[3]*2)
         else:
@@ -84,10 +88,9 @@ class SOLO(pl.LightningModule):
         # you can modify this if you want to train the backbone
         feature_pyramid = [v.detach() for v in self.backbone(images).values()] # this has strides [4,8,16,32,64]
         fpn_feat_list  = self.new_FPN(feature_pyramid) 
-        self.forward_single_level(fpn_feat_list[2], 2)
-        import pdb
-        pdb.set_trace() 
+        cate_pred_list, ins_pred_list = self.MultiApply(self.forward_single_level, feature_pyramid, [i for i in range(len(feature_pyramid))])
         assert cate_pred_list[1].shape[2] == self.num_grids[1]
+        assert ins_pred_list[1].shape[1] == self.num_grids[1]**2
         return cate_pred_list, ins_pred_list
         
     # This function build the ground truth tensor for each batch in the training
@@ -105,7 +108,7 @@ class SOLO(pl.LightningModule):
         heights = boxes_img[:, 3] - boxes_img[:, 1]
         widths = boxes_img[:, 2] - boxes_img[:, 0]
         center_y = (boxes_img[:, 3] + boxes_img[:, 1])/2
-        center_x = (boxes_img[:, 2] + boxes_img[:, 1])/2
+        center_x = (boxes_img[:, 2] + boxes_img[:, 0])/2
             
         centre_regions_x1 = center_x - self.epsilon * widths / 2
         centre_regions_y1 = center_y - self.epsilon * heights / 2    
@@ -115,6 +118,7 @@ class SOLO(pl.LightningModule):
         centre_regions = torch.column_stack([centre_regions_x1, centre_regions_y1, centre_regions_x2, centre_regions_y2])
         
         return centre_regions    
+    
     
     def generate_targets(self, bounding_boxes, labels, masks):
         # Bounding box format: [x_min, y_min, x_max, y_max] 
@@ -143,17 +147,16 @@ class SOLO(pl.LightningModule):
                 feature_w = masks_img.shape[2]// self.strides[j]  
                 mask_target = torch.zeros(self.num_grids[j], self.num_grids[j], 2*feature_h, 2*feature_w).to(self.device)
                 
-                active_masks_per_img.append(active_mask)
-                category_targets_per_img.append(category_target)
-                mask_targets_per_img.append(mask_target) 
                 
                 filtered_centre_regions = centre_regions[fpn_level_masks[:, j]] 
             
                 grid_width = img_width / self.num_grids[j]
                 grid_height = img_height / self.num_grids[j]
                 if len(filtered_centre_regions) == 0:
-                    continue
-                
+                    active_masks_per_img.append(active_mask.reshape(-1))
+                    category_targets_per_img.append(category_target)
+                    mask_targets_per_img.append(mask_target.reshape(-1, 2*feature_h, 2*feature_w)) 
+                    continue 
                 x_grid_starts = (filtered_centre_regions[:, 0] / grid_width).floor().int()
                 x_grid_ends = (filtered_centre_regions[:, 2] / grid_width).floor().int() 
                               
@@ -167,29 +170,73 @@ class SOLO(pl.LightningModule):
                     y_grid_end = y_grid_ends[k]  
                     active_mask[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = 1
                     category_target[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = labels_img[k]
-                    resized_feature = F.interpolate(masks_img[k].view(1,1,img_height, -1), size=(2*feature_h, 2*feature_w), mode='nearest') 
-                    mask_target[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = resized_feature
-                active_masks_per_img[-1] = active_mask.view(-1)
-                category_targets_per_img[-1] = category_target
-                mask_targets_per_img[-1] = mask_target
+                    resized_mask = F.interpolate(masks_img[k].view(1,1,img_height, -1), size=(2*feature_h, 2*feature_w), mode='nearest') 
+                    mask_target[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = resized_mask
+                active_masks_per_img.append(active_mask.reshape(-1))
+                category_targets_per_img.append(category_target)
+                mask_targets_per_img.append(mask_target.reshape(-1, 2*feature_h, 2*feature_w))
                    
             mask_targets.append(mask_targets_per_img)
             category_targets.append(category_targets_per_img)  
             active_masks.append(active_masks_per_img)
-      
         assert len(category_targets) == batch_size
         assert len(mask_targets) == batch_size
         assert len(active_masks) == batch_size
         assert len(category_targets[0]) == self.num_levels
         assert len(mask_targets[0]) == self.num_levels
         assert len(active_masks[0]) == self.num_levels 
+        
+        assert mask_targets[0][1].shape == (self.num_grids[1]**2, 200, 272)
+        assert active_masks[0][1].shape == (self.num_grids[1]**2,)
+        assert category_targets[0][1].shape == (self.num_grids[1], self.num_grids[1])
         return category_targets,mask_targets,active_masks 
     
+    def generate_pixel_coordinates(self, size):
+        h, w = size
+        i_coord_channel = torch.linspace(-1, 1, h).unsqueeze(-1)
+        j_coord_channel = torch.linspace(-1, 1, w).unsqueeze(0)
+        i_coord_channel = i_coord_channel.repeat(1, w)
+        j_coord_channel = j_coord_channel.repeat(h, 1)
+        i_coord_channel = i_coord_channel.unsqueeze(0).unsqueeze(0)
+        j_coord_channel = j_coord_channel.unsqueeze(0).unsqueeze(0)
+        i_coord_channel = i_coord_channel.to(self.device)
+        j_coord_channel = j_coord_channel.to(self.device)
+        return i_coord_channel, j_coord_channel
+        
+    def loss(self,
+             cate_pred_list,
+             ins_pred_list,
+             ins_gts_list,
+             ins_ind_gts_list,
+             cate_gts_list):
+        
+        num_level = len(self.num_grids)
+        for i in range(num_level):
+            self.focal_loss(cate_pred_list[i], cate_gts_list[i], i)   
+     
+        
+    def focal_loss(self, cate_preds, cate_targets, level):
+        ## TODO: compute focalloss
+        import pdb
+        pdb.set_trace()
+        num_classes = 4
+        alpha = self.cate_loss_cfg['alpha'] 
+        gamma = self.cate_loss_cfg['gamma']
+        cat_target_onehot = F.one_hot(torch.tensor(torch.stack(cate_targets),dtype=torch.int64),num_classes=num_classes)
+        cat_target_onehot = cat_target_onehot[:,:,:,-3:].to(self.device)
+        torch.where(cate_gts[0].to(torch.bool), alpha, 1 - alpha)
+        pass
+        
+        
     def training_step(self, batch, batch_idx):
         imgs, labels, masks, bboxes = batch
-        self.generate_targets(bboxes, labels, masks)
-        self(imgs)
-        loss = 0
+        import pdb
+        pdb.set_trace()
+        
+    
+        category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
+        cate_pred_list, ins_pred_list = self(imgs)
+        loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -202,8 +249,6 @@ class SOLO(pl.LightningModule):
         optimizer = optim.Adam(self.parameters(), lr=1e-3)
         return optimizer
 
-    def loss(self):
-        pass     
         
 if __name__ == '__main__':
     imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
@@ -213,5 +258,6 @@ if __name__ == '__main__':
     paths = [imgs_path, masks_path, labels_path, bboxes_path]
     datamodule = SoloDataModule(paths) 
     solo = SOLO()
-    trainer = pl.Trainer(max_epochs=150, devices=1)
+    trainer = pl.Trainer(max_epochs=150, devices=1, precision=16)
+    #trainer = pl.Trainer(max_epochs=150, devices=1)
     trainer.fit(solo, datamodule=datamodule)  
