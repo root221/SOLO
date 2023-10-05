@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from solo_branches import CategoryBranch, MaskBranch
 from torchvision import transforms
 import numpy as np
+from torch.optim.lr_scheduler import MultiStepLR
+from pytorch_lightning.loggers import WandbLogger
 class SOLO(pl.LightningModule):
     _default_cfg = {
         'num_classes': 4,
@@ -48,7 +50,10 @@ class SOLO(pl.LightningModule):
     #         / after upsampling
     def new_FPN(self, fpn_feat_list):
         #strides [8,8,16,32,32]
-        #fpn_feat_list[0] =  
+        fpn_feat_list[0] = F.interpolate(fpn_feat_list[0], scale_factor=0.5,
+                mode='bilinear') 
+        fpn_feat_list[-1] = F.interpolate(fpn_feat_list[-1], (25, 34),  
+                mode='bilinear') 
         return fpn_feat_list
       
     def MultiApply(self, func, *args, **kwargs):
@@ -73,11 +78,11 @@ class SOLO(pl.LightningModule):
 
         # check flag
         if eval == False:
-            resized_feature = F.interpolate(fpn_feat, size=(self.num_grids[idx], self.num_grids[idx]), mode='bilinear') 
+            resized_feature = F.interpolate(fpn_feat, size=(self.num_grids[idx], self.num_grids[idx]), mode='nearest') 
             cate_pred = self.cat_branch(resized_feature, idx)
             x, y = self.generate_pixel_coordinates(fpn_feat.shape[-2:])
             ins_pred = self.mask_branch(fpn_feat, x, y, idx)
-            ins_pred = F.interpolate(ins_pred, scale_factor=2, mode='bilinear') 
+            ins_pred = F.interpolate(ins_pred, scale_factor=2, mode='nearest') 
             assert cate_pred.shape[1:] == (3, num_grid, num_grid)
             assert ins_pred.shape[1:] == (num_grid**2, fpn_feat.shape[2]*2, fpn_feat.shape[3]*2)
         else:
@@ -87,8 +92,13 @@ class SOLO(pl.LightningModule):
     def forward(self, images, eval=True):
         # you can modify this if you want to train the backbone
         feature_pyramid = [v.detach() for v in self.backbone(images).values()] # this has strides [4,8,16,32,64]
-        fpn_feat_list  = self.new_FPN(feature_pyramid) 
-        cate_pred_list, ins_pred_list = self.MultiApply(self.forward_single_level, feature_pyramid, [i for i in range(len(feature_pyramid))])
+        fpn_feat_list  = self.new_FPN(feature_pyramid)
+        cate_pred_list = []
+        ins_pred_list = []
+        for i in range(5): 
+            cate_pred, ins_pred = self.forward_single_level(feature_pyramid[i], i)
+            cate_pred_list.append(cate_pred)
+            ins_pred_list.append(ins_pred)
         assert cate_pred_list[1].shape[2] == self.num_grids[1]
         assert ins_pred_list[1].shape[1] == self.num_grids[1]**2
         return cate_pred_list, ins_pred_list
@@ -141,8 +151,8 @@ class SOLO(pl.LightningModule):
             active_masks_per_img = []
             mask_targets_per_img = []
             for j in range(self.num_levels):        
-                active_mask = torch.zeros((self.num_grids[j],self.num_grids[j])).to(self.device)
-                category_target = torch.zeros((self.num_grids[j],self.num_grids[j])).to(self.device)
+                active_mask = torch.zeros((self.num_grids[j],self.num_grids[j]), dtype=torch.bool).to(self.device)
+                category_target = torch.zeros((self.num_grids[j],self.num_grids[j]), dtype=torch.uint8).to(self.device)
                 feature_h = masks_img.shape[1] // self.strides[j]
                 feature_w = masks_img.shape[2]// self.strides[j]  
                 mask_target = torch.zeros(self.num_grids[j], self.num_grids[j], 2*feature_h, 2*feature_w).to(self.device)
@@ -168,10 +178,10 @@ class SOLO(pl.LightningModule):
                     x_grid_end = x_grid_ends[k]
                     y_grid_start = y_grid_starts[k]
                     y_grid_end = y_grid_ends[k]  
-                    active_mask[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = 1
-                    category_target[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = labels_img[k]
+                    active_mask[y_grid_start:y_grid_end+1, x_grid_start:x_grid_end+1] = 1
+                    category_target[y_grid_start:y_grid_end+1, x_grid_start:x_grid_end+1] = labels_img[k]
                     resized_mask = F.interpolate(masks_img[k].view(1,1,img_height, -1), size=(2*feature_h, 2*feature_w), mode='nearest') 
-                    mask_target[x_grid_start:x_grid_end+1, y_grid_start:y_grid_end+1] = resized_mask
+                    mask_target[y_grid_start:y_grid_end+1, x_grid_start:x_grid_end+1] = resized_mask
                 active_masks_per_img.append(active_mask.reshape(-1))
                 category_targets_per_img.append(category_target)
                 mask_targets_per_img.append(mask_target.reshape(-1, 2*feature_h, 2*feature_w))
@@ -205,50 +215,76 @@ class SOLO(pl.LightningModule):
         
     def loss(self,
              cate_pred_list,
-             ins_pred_list,
-             ins_gts_list,
-             ins_ind_gts_list,
-             cate_gts_list):
+             mask_pred_list,
+             mask_targets_list,
+             active_masks_list,
+             cate_targets_list):
         
         num_level = len(self.num_grids)
+        total_loss = 0
         for i in range(num_level):
-            self.focal_loss(cate_pred_list[i], cate_gts_list[i], i)   
-     
+            cate_targets_per_level = [cate_targets[i] for cate_targets in cate_targets_list]
+            cate_loss = self.cate_loss(cate_pred_list[i], cate_targets_per_level)   
+            total_loss += cate_loss
+            
+            mask_targets_per_level = torch.stack([mask_targets[i] for mask_targets in mask_targets_list])
+            active_masks_per_level = torch.stack([active_masks[i] for active_masks in active_masks_list])
+            mask_loss = self.mask_loss(mask_pred_list[i], mask_targets_per_level, active_masks_per_level)
+   
+            total_loss += mask_loss
+           
+        return total_loss 
+    def mask_loss(self, mask_pred, mask_targets, active_masks):
+        active_indices = torch.where(active_masks)
+        num_active_masks = len(active_indices[0])
+        if num_active_masks == 0:
+            return 0
+        numerator_dice =  2 * (mask_pred[active_indices]* mask_targets[active_indices]).sum(axis=[1,2])
+        denominator_dice = (mask_pred[active_indices]**2).sum(axis=[1,2]) + (mask_targets[active_indices]**2).sum(axis=[1,2])      
+        dice_loss = 1 - numerator_dice/denominator_dice
+        return dice_loss.sum() / num_active_masks
         
-    def focal_loss(self, cate_preds, cate_targets, level):
+    def cate_loss(self, cate_preds, cate_targets):
         ## TODO: compute focalloss
-        import pdb
-        pdb.set_trace()
-        num_classes = 4
+        epsilon = 1e-7
+        batch_size = cate_preds.shape[0]
+        num_grid = cate_preds.shape[-1]
         alpha = self.cate_loss_cfg['alpha'] 
         gamma = self.cate_loss_cfg['gamma']
-        cat_target_onehot = F.one_hot(torch.tensor(torch.stack(cate_targets),dtype=torch.int64),num_classes=num_classes)
-        cat_target_onehot = cat_target_onehot[:,:,:,-3:].to(self.device)
-        torch.where(cate_gts[0].to(torch.bool), alpha, 1 - alpha)
-        pass
-        
+        cate_target_onehot = F.one_hot(torch.stack(cate_targets).to(torch.int64),num_classes=4)
+        cate_target_onehot = cate_target_onehot.permute(0, 3, 1, 2)
+        cate_target_onehot = cate_target_onehot[:,1:,:,:]
+        p = cate_preds*cate_target_onehot + (1 - cate_preds) * (1 - cate_target_onehot)
+        focal_loss = -alpha*torch.log(p+epsilon)*(1-p)**gamma
+        cate_loss = focal_loss.sum() / batch_size / (3*num_grid*num_grid)
+       
+        return cate_loss 
         
     def training_step(self, batch, batch_idx):
         imgs, labels, masks, bboxes = batch
-        import pdb
-        pdb.set_trace()
-        
-    
         category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
         cate_pred_list, ins_pred_list = self(imgs)
         loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
+        self.log("train/loss", loss, on_step=False, on_epoch=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pass
-        
+        imgs, labels, masks, bboxes = batch
+        category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
+        cate_pred_list, ins_pred_list = self(imgs)
+        loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
+        self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True)
+        return loss 
     def on_validation_epoch_end(self):
         pass
     
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=1e-3)
-        return optimizer
+        optimizer = optim.SGD(self.parameters(), lr=8, momentum=0.9, weight_decay=1e-4)
+        scheduler = {
+            'scheduler': MultiStepLR(optimizer, milestones=[27, 33], gamma=0.1),
+        }
 
+        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
         
 if __name__ == '__main__':
     imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
@@ -259,5 +295,5 @@ if __name__ == '__main__':
     datamodule = SoloDataModule(paths) 
     solo = SOLO()
     trainer = pl.Trainer(max_epochs=150, devices=1, precision=16)
-    #trainer = pl.Trainer(max_epochs=150, devices=1)
+    wandb_logger = WandbLogger(name='solo_v1', project="solo", log_model=True)
     trainer.fit(solo, datamodule=datamodule)  

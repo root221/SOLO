@@ -1,11 +1,11 @@
 from torch import nn
+import torch
+kernel_size = 3
+padding = 1
+channels = 256
 class ConvBlock(nn.Module):
     def __init__(self, in_channels):
         super(ConvBlock, self).__init__()
-        # Shared hyperparameters
-        kernel_size = 3
-        padding = 1
-        channels = 256
         # Define layers
         self.conv1 = nn.Conv2d(in_channels, channels, kernel_size, stride=1, padding=padding, bias=False)
         self.gn1 = nn.GroupNorm(num_groups=32, num_channels=channels)
@@ -39,32 +39,34 @@ class ConvBlock(nn.Module):
         return x
 
 class CategoryBranch(nn.Module):
-    def __init__(self, C=4):
+    def __init__(self, C=4, num_levels=5):
         super(CategoryBranch, self).__init__()
-        kernel_size = 3
-        padding = 1
-        channels = 256
         self.conv_block = ConvBlock(channels)
-        self.conv_out = nn.Conv2d(channels, C-1, kernel_size, stride=1, padding=padding, bias=True)
+        self.conv_outs = nn.ModuleList([nn.Conv2d(channels, C-1, kernel_size, stride=1, padding=padding, bias=True) for _ in range(num_levels)])
         self.sigmoid = nn.Sigmoid()
         
-    def forward(self, x):
+    def forward(self, x, level):
         x = self.conv_block(x)  
-        x = self.sigmoid(self.conv_out(x))
+        x = self.sigmoid(self.conv_outs[level](x))
         return x 
        
     
 class MaskBranch(nn.Module):
-    def __init__(self, num_grid, channels=256):
+    def __init__(self, num_grids, channels=256):
         super(MaskBranch, self).__init__()
 
         # Use the defined ConvBlock
         self.conv_block = ConvBlock(channels+2)
-        self.conv_out = nn.Conv2d(channels, num_grid*num_grid, kernel_size=1, stride=1, padding=0, bias=True)
+        self.conv_outs = nn.ModuleList([nn.Conv2d(channels, num_grid*num_grid, kernel_size=1, stride=1, padding=0, bias=True) for num_grid in num_grids])
         self.sigmoid = nn.Sigmoid()
         
-    def forward(self, x):
-        x = self.conv_block(x)
-        x = self.sigmoid(self.conv_out(x))
+    def forward(self, feature, x, y, level):
+        batch_size = feature.shape[0]
+        h, w = feature.shape[-2:] 
+        x_expanded = x.expand(batch_size, 1, h, w)  
+        y_expanded = y.expand(batch_size, 1, h, w)
+        input_feature = torch.cat([feature, x_expanded, y_expanded], dim=1)
+        x = self.conv_block(input_feature)
+        x = self.sigmoid(self.conv_outs[level](x))
         return x
 
