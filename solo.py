@@ -1,4 +1,4 @@
-import pytorch_lightning as pl
+import matplotlib.pyplot as plt
 import torchvision
 from solo_datamodule import SoloDataModule
 from torch import optim
@@ -10,6 +10,8 @@ from torchvision import transforms
 import numpy as np
 from torch.optim.lr_scheduler import MultiStepLR
 from pytorch_lightning.loggers import WandbLogger
+import pytorch_lightning as pl
+import os
 class SOLO(pl.LightningModule):
     _default_cfg = {
         'num_classes': 4,
@@ -36,18 +38,9 @@ class SOLO(pl.LightningModule):
         self.scale_ranges = torch.tensor(self.scale_ranges)
         self.cat_branch = CategoryBranch()
         self.mask_branch = MaskBranch(self.num_grids)
-    # Forward function should calculate across each level of the feature pyramid network.
-    # Input:
-    #     images: batch_size number of images
-    # Output:
-    #     if eval = False
-    #         category_predictions: list, len(fpn_levels), each (batch_size, C-1, S, S)
-    #         mask_predictions:     list, len(fpn_levels), each (batch_size, S^2, 2*feature_h, 2*feature_w)
-    #     if eval==True
-    #         category_predictions: list, len(fpn_levels), each (batch_size, S, S, C-1)
-    #         / after point_NMS
-    #         mask_predictions:     list, len(fpn_levels), each (batch_size, S^2, image_h/4, image_w/4)
-    #         / after upsampling
+        self.mean=[0.485, 0.456, 0.406]
+        self.std=[0.229, 0.224, 0.225]
+        
     def new_FPN(self, fpn_feat_list):
         #strides [8,8,16,32,32]
         fpn_feat_list[0] = F.interpolate(fpn_feat_list[0], scale_factor=0.5,
@@ -56,11 +49,6 @@ class SOLO(pl.LightningModule):
                 mode='bilinear') 
         return fpn_feat_list
       
-    def MultiApply(self, func, *args, **kwargs):
-        pfunc = partial(func, **kwargs) if kwargs else func
-        map_results = map(pfunc, *args)
-                 
-        return tuple(map(list, zip(*map_results)))
     
     def forward_single_level(self, fpn_feat, idx, eval=False, upsample_shape=None):
         # upsample_shape is used in eval mode
@@ -221,18 +209,20 @@ class SOLO(pl.LightningModule):
              cate_targets_list):
         
         num_level = len(self.num_grids)
-        total_loss = 0
+        total_cate_loss = 0
+        total_mask_loss = 0
         for i in range(num_level):
             cate_targets_per_level = [cate_targets[i] for cate_targets in cate_targets_list]
             cate_loss = self.cate_loss(cate_pred_list[i], cate_targets_per_level)   
-            total_loss += cate_loss
+            total_cate_loss += cate_loss
             
             mask_targets_per_level = torch.stack([mask_targets[i] for mask_targets in mask_targets_list])
             active_masks_per_level = torch.stack([active_masks[i] for active_masks in active_masks_list])
             mask_loss = self.mask_loss(mask_pred_list[i], mask_targets_per_level, active_masks_per_level)
    
-            total_loss += mask_loss
-        return total_loss 
+            total_mask_loss += mask_loss
+        return total_cate_loss, total_mask_loss
+        
     def mask_loss(self, mask_pred, mask_targets, active_masks):
         active_indices = torch.where(active_masks)
         num_active_masks = len(active_indices[0])
@@ -264,25 +254,35 @@ class SOLO(pl.LightningModule):
         imgs, labels, masks, bboxes = batch
         category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
         cate_pred_list, ins_pred_list = self(imgs)
-        loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, logger=True)
-        return loss
-    '''
+        
+        total_cate_loss, total_mask_loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
+        total_loss = total_cate_loss + total_mask_loss
+        self.log("train/loss", total_loss, on_step=True, on_epoch=True, logger=True)
+        self.log("train/category_loss", total_cate_loss, on_step=False, on_epoch=True, logger=True)
+        self.log("train/mask_loss", total_mask_loss, on_step=False, on_epoch=True, logger=True)
+        return total_loss
+    
     def validation_step(self, batch, batch_idx):
         imgs, labels, masks, bboxes = batch
         category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
         cate_pred_list, ins_pred_list = self(imgs)
-        loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
-        self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True)
-        return loss 
-    '''
+        
+        total_cate_loss, total_mask_loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
+        total_loss = total_cate_loss + total_mask_loss
+        self.log("val/loss", total_loss, on_step=True, on_epoch=True, logger=True)
+        self.log("val/category_loss", total_cate_loss, on_step=False, on_epoch=True, logger=True)
+        self.log("val/mask_loss", total_mask_loss, on_step=False, on_epoch=True, logger=True)
+        return total_loss
+    
     def test_step(self, batch, batch_idx):
-        pass
-        #imgs, labels, masks, bboxes = batch
-        #category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
-        #cate_pred_list, ins_pred_list = self(imgs, True)
-        #post_process_results = self.post_processing(cate_pred_list, ins_pred_list) 
-        #return {}
+        if batch_idx < 10:
+            imgs, labels, masks, bboxes = batch
+            category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
+            cate_pred_list, ins_pred_list = self(imgs, True)
+            post_process_results = self.post_processing(cate_pred_list, ins_pred_list) 
+            filename = f"batch_{batch_idx}.png"
+            self.plot(imgs, post_process_results, filename)
+        return {}
        
     def configure_optimizers(self):
         optimizer = optim.SGD(self.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
@@ -385,8 +385,50 @@ class SOLO(pl.LightningModule):
         binary_masks = sorted_mask_preds > self.postprocess_cfg['mask_thresh'] 
         return binary_masks, cate_labels, cate_scores
     
-    def plot_infer(self, cate_scores_list, cate_labels_list, binary_masks_list, imgs, i):
-        pass 
+    
+    def plot(self, imgs, post_process_results, filename):
+        
+        batch_size = len(post_process_results)
+        fig, axes = plt.subplots(batch_size//2, 2, figsize=(16, 16))
+          
+        imgs = imgs.cpu().numpy()
+        imgs = np.moveaxis(imgs, 1, -1) 
+        # denormalize the image
+        imgs = (imgs * self.std) + self.mean
+        imgs = np.clip(imgs, 0, 1)
+       
+        
+        for i in range(batch_size):
+            ax = axes.ravel()[i]
+            img = imgs[i]
+            masks = post_process_results[i][0].cpu()
+            labels = post_process_results[i][1]
+            scores = post_process_results[i][2]
+            
+            ax.imshow(img)
+        
+            for j, mask in enumerate(masks):
+                if scores[j] < 0.2:
+                    continue
+
+                mask_img = np.zeros((img.shape[0], img.shape[1], 4))
+                label = labels[j].item()
+        
+                resized_mask = F.interpolate(mask[None, None, :, :].float(), size=(800, 1088), mode='nearest').squeeze()
+     
+                if label == 0:
+                    mask_img[resized_mask != 0] = [1, 0, 0, 0.5]
+                elif label == 1:
+                    mask_img[resized_mask != 0] = [0, 1, 0, 0.5]
+                else:
+                    mask_img[resized_mask != 0] = [0, 0, 1, 0.5]
+          
+                ax.imshow(mask_img)
+
+
+        plt.tight_layout()
+        output_path = os.path.join('inference_plots', filename)
+        plt.savefig(output_path, dpi=80, bbox_inches='tight')
         
 if __name__ == '__main__':
     imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
@@ -399,3 +441,4 @@ if __name__ == '__main__':
     wandb_logger = WandbLogger(name='solo_v1', project="solo", log_model=True)
     trainer = pl.Trainer(max_epochs=40, devices=1, precision=16, logger=wandb_logger)
     trainer.fit(solo, datamodule=datamodule) 
+    #trainer.test(solo, datamodule=datamodule)
