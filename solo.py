@@ -24,7 +24,7 @@ class SOLO(pl.LightningModule):
         'cate_loss_cfg': dict(gamma=2, alpha=0.25, weight=1),
         'postprocess_cfg': dict(cate_thresh=0.2, mask_thresh=0.5, pre_NMS_num=50, keep_instance=5, IoU_thresh=0.5)
     }
-
+   
     def __init__(self, **kwargs):
         super().__init__()
         for k, v in {**self._default_cfg, **kwargs}.items():
@@ -232,7 +232,6 @@ class SOLO(pl.LightningModule):
             mask_loss = self.mask_loss(mask_pred_list[i], mask_targets_per_level, active_masks_per_level)
    
             total_loss += mask_loss
-           
         return total_loss 
     def mask_loss(self, mask_pred, mask_targets, active_masks):
         active_indices = torch.where(active_masks)
@@ -254,8 +253,9 @@ class SOLO(pl.LightningModule):
         cate_target_onehot = F.one_hot(torch.stack(cate_targets).to(torch.int64),num_classes=4)
         cate_target_onehot = cate_target_onehot.permute(0, 3, 1, 2)
         cate_target_onehot = cate_target_onehot[:,1:,:,:]
-        p = cate_preds*cate_target_onehot + (1 - cate_preds) * (1 - cate_target_onehot)
-        focal_loss = -alpha*torch.log(p+epsilon)*(1-p)**gamma
+        p_t = cate_preds*cate_target_onehot + (1 - cate_preds) * (1 - cate_target_onehot)
+        alpha_t = alpha*cate_target_onehot + (1 - alpha) * (1 - cate_target_onehot)
+        focal_loss = -alpha_t*torch.log(p_t+epsilon)*(1-p_t)**gamma
         cate_loss = focal_loss.sum() / batch_size / (3*num_grid*num_grid)
        
         return cate_loss 
@@ -265,13 +265,14 @@ class SOLO(pl.LightningModule):
         category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
         cate_pred_list, ins_pred_list = self(imgs)
         loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
-        self.log("train/loss", loss, on_step=False, on_epoch=True, logger=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         imgs, labels, masks, bboxes = batch
         category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
         cate_pred_list, ins_pred_list = self(imgs)
+        self.post_processing(cate_pred_list, ins_pred_list)
         loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
         self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True)
         return loss 
@@ -279,12 +280,49 @@ class SOLO(pl.LightningModule):
         pass
     
     def configure_optimizers(self):
-        optimizer = optim.SGD(self.parameters(), lr=8, momentum=0.9, weight_decay=1e-4)
+        optimizer = optim.SGD(self.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
         scheduler = {
             'scheduler': MultiStepLR(optimizer, milestones=[27, 33], gamma=0.1),
         }
 
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+    
+    def points_nms(self, heat, kernel=2):
+        # Input:  (batch_size, C-1, S, S)
+        # Output: (batch_size, C-1, S, S)
+        # kernel must be 2
+        hmax = F.max_pool2d(
+            heat, (kernel, kernel), stride=1, padding=1)
+        keep = (hmax[:, :, :-1, :-1] == heat).float()
+        return heat * keep
+  
+
+    def MatrixNMS(self, sorted_masks, sorted_scores, method='gauss', gauss_sigma=0.5):
+        #Input:
+        #    sorted_masks: (n_active, image_h/4, image_w/4)
+        #    sorted_scores: (n_active,)
+        #Output:
+        #    decay_scores: (n_active,)
+        n = len(sorted_scores)
+        sorted_masks = sorted_masks.reshape(n, -1)
+        intersection = torch.mm(sorted_masks, sorted_masks.T)
+        areas = sorted_masks.sum(dim=1).expand(n, n)
+        union = areas + areas.T - intersection
+        ious = (intersection / union).triu(diagonal=1)
+
+        ious_cmax = ious.max(0)[0].expand(n, n).T
+        if method == 'gauss':
+            decay = torch.exp(-(ious ** 2 - ious_cmax ** 2) / gauss_sigma)
+        else:
+            decay = (1 - ious) / (1 - ious_cmax)
+        decay = decay.min(dim=0)[0]
+        return sorted_scores * decay
+        
+    
+    def post_processing(self, cate_preds, mask_preds):
+        import pdb
+        pdb.set_trace()
+        inds = (cate_preds > self.postprocess_cfg['cate_thresh'])
         
 if __name__ == '__main__':
     imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
@@ -294,6 +332,6 @@ if __name__ == '__main__':
     paths = [imgs_path, masks_path, labels_path, bboxes_path]
     datamodule = SoloDataModule(paths) 
     solo = SOLO()
-    trainer = pl.Trainer(max_epochs=150, devices=1, precision=16)
     wandb_logger = WandbLogger(name='solo_v1', project="solo", log_model=True)
+    trainer = pl.Trainer(max_epochs=40, devices=1, precision=16, logger=wandb_logger)
     trainer.fit(solo, datamodule=datamodule)  
