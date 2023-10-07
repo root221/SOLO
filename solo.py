@@ -70,18 +70,17 @@ class SOLO(pl.LightningModule):
         ins_pred = fpn_feat
         num_grid = self.num_grids[idx]  # current level grid
 
+        resized_feature = F.interpolate(fpn_feat, size=(self.num_grids[idx], self.num_grids[idx]), mode='nearest') 
+        cate_pred = self.cat_branch(resized_feature, idx)
+        x, y = self.generate_pixel_coordinates(fpn_feat.shape[-2:])
+        ins_pred = self.mask_branch(fpn_feat, x, y, idx)
         # in inference time, upsample the pred to (ori image size/4)
         if eval == True:
-            ## TODO resize ins_pred
-
             cate_pred = self.points_nms(cate_pred).permute(0,2,3,1)
+            ins_pred = F.interpolate(ins_pred, (200, 272), mode='nearest') 
 
         # check flag
         if eval == False:
-            resized_feature = F.interpolate(fpn_feat, size=(self.num_grids[idx], self.num_grids[idx]), mode='nearest') 
-            cate_pred = self.cat_branch(resized_feature, idx)
-            x, y = self.generate_pixel_coordinates(fpn_feat.shape[-2:])
-            ins_pred = self.mask_branch(fpn_feat, x, y, idx)
             ins_pred = F.interpolate(ins_pred, scale_factor=2, mode='nearest') 
             assert cate_pred.shape[1:] == (3, num_grid, num_grid)
             assert ins_pred.shape[1:] == (num_grid**2, fpn_feat.shape[2]*2, fpn_feat.shape[3]*2)
@@ -89,18 +88,19 @@ class SOLO(pl.LightningModule):
             pass
         return cate_pred, ins_pred
         
-    def forward(self, images, eval=True):
+    def forward(self, images, eval=False):
         # you can modify this if you want to train the backbone
         feature_pyramid = [v.detach() for v in self.backbone(images).values()] # this has strides [4,8,16,32,64]
         fpn_feat_list  = self.new_FPN(feature_pyramid)
         cate_pred_list = []
         ins_pred_list = []
         for i in range(5): 
-            cate_pred, ins_pred = self.forward_single_level(feature_pyramid[i], i)
+            cate_pred, ins_pred = self.forward_single_level(feature_pyramid[i], i, eval)
             cate_pred_list.append(cate_pred)
             ins_pred_list.append(ins_pred)
-        assert cate_pred_list[1].shape[2] == self.num_grids[1]
-        assert ins_pred_list[1].shape[1] == self.num_grids[1]**2
+        if eval == False:
+            assert cate_pred_list[1].shape[2] == self.num_grids[1]
+            assert ins_pred_list[1].shape[1] == self.num_grids[1]**2
         return cate_pred_list, ins_pred_list
         
     # This function build the ground truth tensor for each batch in the training
@@ -267,18 +267,23 @@ class SOLO(pl.LightningModule):
         loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
         self.log("train/loss", loss, on_step=True, on_epoch=True, logger=True)
         return loss
-
+    '''
     def validation_step(self, batch, batch_idx):
         imgs, labels, masks, bboxes = batch
         category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
         cate_pred_list, ins_pred_list = self(imgs)
-        self.post_processing(cate_pred_list, ins_pred_list)
         loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
         self.log("val/loss", loss, on_step=False, on_epoch=True, logger=True)
         return loss 
-    def on_validation_epoch_end(self):
+    '''
+    def test_step(self, batch, batch_idx):
         pass
-    
+        #imgs, labels, masks, bboxes = batch
+        #category_targets, mask_targets, active_masks = self.generate_targets(bboxes, labels, masks)
+        #cate_pred_list, ins_pred_list = self(imgs, True)
+        #post_process_results = self.post_processing(cate_pred_list, ins_pred_list) 
+        #return {}
+       
     def configure_optimizers(self):
         optimizer = optim.SGD(self.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
         scheduler = {
@@ -297,7 +302,7 @@ class SOLO(pl.LightningModule):
         return heat * keep
   
 
-    def MatrixNMS(self, sorted_masks, sorted_scores, method='gauss', gauss_sigma=0.5):
+    def matrix_nms(self, sorted_masks, sorted_scores, method='gauss', gauss_sigma=0.5):
         #Input:
         #    sorted_masks: (n_active, image_h/4, image_w/4)
         #    sorted_scores: (n_active,)
@@ -317,12 +322,71 @@ class SOLO(pl.LightningModule):
             decay = (1 - ious) / (1 - ious_cmax)
         decay = decay.min(dim=0)[0]
         return sorted_scores * decay
-        
     
-    def post_processing(self, cate_preds, mask_preds):
-        import pdb
-        pdb.set_trace()
+    def post_processing(self, cate_pred_list, mask_pred_list):
+        assert len(mask_pred_list) == len(cate_pred_list)
+        num_levels = len(cate_pred_list)
+        num_imgs = cate_pred_list[0].shape[0]
+        num_channels = cate_pred_list[0].shape[-1]
+        #featmap_size = seg_preds[0].size()[-2:]
+        result_list = []
+        for img_id in range(num_imgs):
+            cate_preds = [
+                cate_pred_list[i][img_id].view(-1, num_channels).detach() for i in range(num_levels)
+            ]
+            mask_preds = [
+                mask_pred_list[i][img_id].detach() for i in range(num_levels)
+            ]
+            cate_preds = torch.cat(cate_preds, dim=0)
+            mask_preds = torch.cat(mask_preds, dim=0)
+
+            post_process_result = self.post_processing_img(cate_preds, mask_preds)
+    
+            result_list.append(post_process_result)
+        return result_list
+    
+    def post_processing_img(self, cate_preds, mask_preds):
+        
         inds = (cate_preds > self.postprocess_cfg['cate_thresh'])
+        cate_scores = cate_preds[inds]
+        if len(cate_scores) == 0:
+            return None 
+       
+        # category labels.
+        inds = inds.nonzero()
+        cate_labels = inds[:, 1]
+
+        mask_preds = mask_preds[inds[:, 0]]
+        binary_mask = mask_preds > self.postprocess_cfg['mask_thresh']
+        num_fg_pixels = binary_mask.sum((1, 2)).float()
+        maskness = (mask_preds * binary_mask).sum((1, 2)) / num_fg_pixels
+        cate_scores *= maskness
+        
+        # sort and keep top nms_pre
+        sort_inds = torch.argsort(cate_scores, descending=True)
+        pre_NMS_num = self.postprocess_cfg['pre_NMS_num']
+        if len(sort_inds) > pre_NMS_num:
+            sort_inds = sort_inds[:pre_NMS_num]
+        sorted_masks = binary_mask[sort_inds].float()
+        sorted_scores = cate_scores[sort_inds]
+        sorted_mask_preds = mask_preds[sort_inds]
+        cate_labels = cate_labels[sort_inds]
+
+        # Matrix NMS
+        cate_scores = self.matrix_nms(sorted_masks, sorted_scores)
+
+        # sort and keep top_k
+        sort_inds = torch.argsort(cate_scores, descending=True)
+        sort_inds = sort_inds[:self.postprocess_cfg['keep_instance']]
+        sorted_mask_preds = sorted_mask_preds[sort_inds]
+        cate_scores = cate_scores[sort_inds]
+        cate_labels = cate_labels[sort_inds]
+        
+        binary_masks = sorted_mask_preds > self.postprocess_cfg['mask_thresh'] 
+        return binary_masks, cate_labels, cate_scores
+    
+    def plot_infer(self, cate_scores_list, cate_labels_list, binary_masks_list, imgs, i):
+        pass 
         
 if __name__ == '__main__':
     imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
@@ -334,4 +398,4 @@ if __name__ == '__main__':
     solo = SOLO()
     wandb_logger = WandbLogger(name='solo_v1', project="solo", log_model=True)
     trainer = pl.Trainer(max_epochs=40, devices=1, precision=16, logger=wandb_logger)
-    trainer.fit(solo, datamodule=datamodule)  
+    trainer.fit(solo, datamodule=datamodule) 
