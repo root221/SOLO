@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import MultiStepLR
 from pytorch_lightning.loggers import WandbLogger
 import pytorch_lightning as pl
 import os
+from matplotlib.patches import Rectangle
 class SOLO(pl.LightningModule):
     _default_cfg = {
         'num_classes': 4,
@@ -224,6 +225,7 @@ class SOLO(pl.LightningModule):
         return total_cate_loss, total_mask_loss
         
     def mask_loss(self, mask_pred, mask_targets, active_masks):
+        batch_size = mask_pred.shape[0]
         active_indices = torch.where(active_masks)
         num_active_masks = len(active_indices[0])
         if num_active_masks == 0:
@@ -246,7 +248,7 @@ class SOLO(pl.LightningModule):
         p_t = cate_preds*cate_target_onehot + (1 - cate_preds) * (1 - cate_target_onehot)
         alpha_t = alpha*cate_target_onehot + (1 - alpha) * (1 - cate_target_onehot)
         focal_loss = -alpha_t*torch.log(p_t+epsilon)*(1-p_t)**gamma
-        cate_loss = focal_loss.sum() / batch_size / (3*num_grid*num_grid)
+        cate_loss = focal_loss.sum() / (3*num_grid*num_grid) / batch_size
        
         return cate_loss 
         
@@ -257,7 +259,7 @@ class SOLO(pl.LightningModule):
         
         total_cate_loss, total_mask_loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
         total_loss = total_cate_loss + total_mask_loss
-        self.log("train/loss", total_loss, on_step=True, on_epoch=True, logger=True)
+        self.log("train/loss", total_loss, on_step=False, on_epoch=True, logger=True)
         self.log("train/category_loss", total_cate_loss, on_step=False, on_epoch=True, logger=True)
         self.log("train/mask_loss", total_mask_loss, on_step=False, on_epoch=True, logger=True)
         return total_loss
@@ -269,7 +271,7 @@ class SOLO(pl.LightningModule):
         
         total_cate_loss, total_mask_loss = self.loss(cate_pred_list, ins_pred_list, mask_targets, active_masks, category_targets)
         total_loss = total_cate_loss + total_mask_loss
-        self.log("val/loss", total_loss, on_step=True, on_epoch=True, logger=True)
+        self.log("val/loss", total_loss, on_step=False, on_epoch=True, logger=True)
         self.log("val/category_loss", total_cate_loss, on_step=False, on_epoch=True, logger=True)
         self.log("val/mask_loss", total_mask_loss, on_step=False, on_epoch=True, logger=True)
         return total_loss
@@ -281,11 +283,11 @@ class SOLO(pl.LightningModule):
             cate_pred_list, ins_pred_list = self(imgs, True)
             post_process_results = self.post_processing(cate_pred_list, ins_pred_list) 
             filename = f"batch_{batch_idx}.png"
-            self.plot(imgs, post_process_results, filename)
+            self.plot(imgs, post_process_results, labels, masks, bboxes, filename)
         return {}
        
     def configure_optimizers(self):
-        optimizer = optim.SGD(self.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
+        optimizer = optim.SGD(self.parameters(), lr=0.005, momentum=0.9, weight_decay=1e-4)
         scheduler = {
             'scheduler': MultiStepLR(optimizer, milestones=[27, 33], gamma=0.1),
         }
@@ -386,10 +388,10 @@ class SOLO(pl.LightningModule):
         return binary_masks, cate_labels, cate_scores
     
     
-    def plot(self, imgs, post_process_results, filename):
+    def plot(self, imgs, post_process_results, gt_labels, gt_masks, gt_bboxes, filename):
         
         batch_size = len(post_process_results)
-        fig, axes = plt.subplots(batch_size//2, 2, figsize=(16, 16))
+        fig, axes = plt.subplots(batch_size, 2, figsize=(16, 16))
           
         imgs = imgs.cpu().numpy()
         imgs = np.moveaxis(imgs, 1, -1) 
@@ -399,18 +401,49 @@ class SOLO(pl.LightningModule):
        
         
         for i in range(batch_size):
-            ax = axes.ravel()[i]
             img = imgs[i]
+          
+            # --------------------
+            # Ground Truth Section
+            # --------------------
+            ax = axes[i, 0]
+            masks = gt_masks[i].cpu()
+            labels = gt_labels[i]
+            bboxes = gt_bboxes[i].cpu()
+            ax.imshow(img)
+        
+            for bbox in bboxes:
+                x, y = bbox[0], bbox[1]
+                width = bbox[2] - bbox[0]
+                height = bbox[3] - bbox[1]
+                rect = Rectangle((x, y), width, height, linewidth=1, edgecolor="red", facecolor='none')
+                ax.add_patch(rect)
+        
+            for j, label in enumerate(labels):
+                mask_img = np.zeros((img.shape[0], img.shape[1], 4))
+
+                if label == 1:
+                    mask_img[masks[j] != 0] = [1, 0, 0, 0.5]
+                elif label == 2:
+                    mask_img[masks[j] != 0] = [0, 1, 0, 0.5]
+                else:
+                    mask_img[masks[j] != 0] = [0, 0, 1, 0.5]
+          
+                ax.imshow(mask_img)
+            
+            # ---------------------
+            # Inference Result Section
+            # ---------------------
+    
+            ax = axes[i, 1]
             masks = post_process_results[i][0].cpu()
             labels = post_process_results[i][1]
             scores = post_process_results[i][2]
-            
             ax.imshow(img)
         
             for j, mask in enumerate(masks):
                 if scores[j] < 0.2:
                     continue
-
                 mask_img = np.zeros((img.shape[0], img.shape[1], 4))
                 label = labels[j].item()
         
@@ -438,7 +471,9 @@ if __name__ == '__main__':
     paths = [imgs_path, masks_path, labels_path, bboxes_path]
     datamodule = SoloDataModule(paths) 
     solo = SOLO()
+    
     wandb_logger = WandbLogger(name='solo_v1', project="solo", log_model=True)
-    trainer = pl.Trainer(max_epochs=40, devices=1, precision=16, logger=wandb_logger)
+    trainer = pl.Trainer(max_epochs=36, precision=16, logger=wandb_logger, devices=1)
     trainer.fit(solo, datamodule=datamodule) 
-    #trainer.test(solo, datamodule=datamodule)
+    print("Training completed for model 'solo_v1' for 36 epochs!")
+    trainer.test(solo, datamodule=datamodule)
