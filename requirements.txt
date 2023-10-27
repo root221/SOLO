@@ -1,0 +1,6 @@
+wandb==0.15.12
+pytorch-lightning==2.0.8
+matplotlib==3.8.0
+torch==2.0.1
+torchvision==0.15.2
+h5py

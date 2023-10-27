@@ -20,7 +20,11 @@ This project utilizes a simplified version of the COCO dataset. The modified dat
 The following packages and versions were used in this project:
 - wandb 0.15.12
 - pytorch-lightning 2.0.8
-    
+- torch 2.0.1
+- torchvision 0.15.2
+- matplotlib
+- h5py
+
 ### Installation & Usage
     
 ```bash
