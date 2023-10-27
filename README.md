@@ -5,7 +5,7 @@
 [SOLO](https://arxiv.org/abs/1912.04488) is a method for instance segmentation. This repository provides an implementation of the SOLO model as described in the paper. This repository provides an implementation and results of the SOLO model. 
 
 ## Visual Results
-
+For each paired image below, the left showcases the ground truth while the right highlights the model's predictions. 
 ![Result 1](inference_plots/batch_2.png)
 ![Result 2](inference_plots/batch_18.png)
 <!-- Add more images or results as needed -->
