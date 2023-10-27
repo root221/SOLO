@@ -6,8 +6,8 @@
 
 ## Visual Results
 
-![Result 1](inference_plots/batch_18.png)
-![Result 2](inference_plots/batch_2.png)
+![Result 1](inference_plots/batch_2.png)
+![Result 2](inference_plots/batch_18.png)
 <!-- Add more images or results as needed -->
     
 ## Dataset 
@@ -16,9 +16,9 @@ This project utilizes a simplified version of the COCO dataset. The modified dat
 ## Getting Started
     
 ### Prerequisites
-    The following packages and versions were used in this project:
-    - wandb 0.15.12
-    - pytorch-lightning 2.0.8
+The following packages and versions were used in this project:
+- wandb 0.15.12
+- pytorch-lightning 2.0.8
     
 ### Installation & Usage
     
