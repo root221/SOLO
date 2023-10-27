@@ -32,7 +32,7 @@ The following packages and versions were used in this project:
 git clone https://github.com/root221/solo.git
     
 # Navigate to the project directory and install required packages:
-cd solo
+cd SOLO
 pip install -r requirements.txt
     
 # Download the data from the above link and place it in the 'data' directory 
