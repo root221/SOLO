@@ -75,7 +75,7 @@ class SOLO(pl.LightningModule):
             assert ins_pred.shape[1:] == (num_grid**2, fpn_feat.shape[2]*2, fpn_feat.shape[3]*2)
         else:
             pass
-        return cate_pred, ins_pred
+        return cate_pred, ins_pred # cate_pred.shape: (8, 3, S, S), where 8 represents the batch size and 3 represents the three categories: vehicles, people, and animals.
         
     def forward(self, images, eval=False):
         # you can modify this if you want to train the backbone
